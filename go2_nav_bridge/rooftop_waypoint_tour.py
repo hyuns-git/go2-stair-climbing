@@ -21,6 +21,8 @@ rosbag(run2~5)에서 5초 이상 정지한 지점을 평균한 ~/rooftop_waypoin
   ros2 run go2_nav_bridge rooftop_waypoint_tour               # 전체 5곳
   ros2 run go2_nav_bridge rooftop_waypoint_tour --email       # 끝나고 사진 이메일 전송
   --wp-file <경로>   (기본 ~/rooftop_waypoints.yaml)   --no-photo   사진 생략
+  --goto X Y        출발 자세 기준 로컬 좌표(x 앞, y 왼쪽, m)로 한 번만 이동 (장애물 회피 시험용:
+                    앞 1.5m에 의자 등을 놓고 `--goto 3 0`). 사진/yaml 없이 동작.
 
 실행 전 확인: cmd_vel_bridge/stair_traverse_node가 떠 있으면 먼저 내려둘 것.
 """
@@ -30,6 +32,7 @@ import sys
 import threading
 import time
 
+import numpy as np
 import rclpy
 import yaml
 from rclpy.executors import SingleThreadedExecutor
@@ -148,9 +151,69 @@ GUARD_SCAN_MAX_AGE_SEC = 1.0
 # 라이다 높이 필터(scan_maker_l1 min_height 0.05~max_height 0.60m) 안에 들어오는 물체만 보임.
 # 이 가드는 "정지"만 한다(회피 아님). 정지하면 투어를 중단하고 찍은 사진은 이메일로 보냄.
 
+AVOID_ENABLED = _env_float('TOUR_AVOID', 1.0) != 0.0
+AVOID_HALF_WIDTH_M = _env_float('TOUR_AVOID_HALF_WIDTH_M', 0.32)  # 로봇 반폭(약 0.15) + 여유
+AVOID_BODY_BACK_M = 0.2    # 몸통 길이: 로봇 중심보다 이만큼 뒤의 점까지 통로에 포함(옆 모서리 스침 방지)
+AVOID_TRIGGER_M = _env_float('TOUR_AVOID_TRIGGER_M', 0.8)  # 목표 방향 통로가 이 미만이면 회피 모드 진입
+AVOID_RELEASE_M = _env_float('TOUR_AVOID_RELEASE_M', 1.3)  # 목표 방향이 이 이상 비면 회피 종료
+AVOID_SELF_RANGE_M = 0.45   # 이 안쪽 점은 로봇 자기 몸(센서 앞 0.1~0.17m, 옆 0.3m에 항상 찍힘, 2026-10-07 bag)이라 무시
+AVOID_LOOK_M = 1.6          # 이 거리까지만 장애물을 고려
+AVOID_OK_M = _env_float('TOUR_AVOID_OK_M', 1.2)   # 이만큼 비어 있어야 그 방향을 "통과 가능"으로 봄
+AVOID_MAX_DEV_M = _env_float('TOUR_AVOID_MAX_DEV_M', 1.0)  # 출발->목표 직선에서 옆으로 벗어날 최대치
+AVOID_MAX_SEC = _env_float('TOUR_AVOID_MAX_SEC', 20.0)     # 한 구간에서 회피 기동을 할 최대 시간
+AVOID_SPEED = _env_float('TOUR_AVOID_SPEED', 0.35)         # 회피 중 속도 상한
+AVOID_PHI_RANGE_DEG = 100   # 후보 방향: 목표 방위가 아닌 로봇 정면 기준 +-100도
+AVOID_SWITCH_COST = 0.3     # 직전 선택 방향과 달라질 때 벌점(떨림 방지)
+# 2026-10-07: 옥상은 사람 없는 고정 환경이라 정지 대신 회피로 미션을 완주한다. /scan에서 로봇
+# 폭만큼의 통로가 AVOID_OK_M 이상 비어 있는 방향 중 목표 방위에 가장 가까운 것을 골라 간다.
+# **라이다는 옥상 가장자리/낮은 단차를 못 본다** -> 옆으로 벗어나는 폭(AVOID_MAX_DEV_M)과 회피
+# 시간을 제한하고, 통과 가능한 방향이 없거나 한계를 넘으면 정지(투어 중단)한다.
+
 STEER_KP = _env_float('TOUR_STEER_KP', 1.0)
 STEER_MAX_Z = _env_float('TOUR_STEER_MAX_Z', 0.4)
 STEER_FREEZE_M = 0.4   # 목표까지 이보다 가까우면 방위 갱신을 멈춤(근접 시 방위가 흔들림)
+
+
+def scan_points(node):
+    """/scan -> 로봇 좌표계 점 (xs, ys). 데이터 없음/오래됨 -> None. (scan 각도 0 = 로봇 정면)"""
+    scan = node.latest_scan
+    if scan is None or node.latest_scan_recv_time is None:
+        return None
+    age = (node.get_clock().now() - node.latest_scan_recv_time).nanoseconds / 1e9
+    if age > GUARD_SCAN_MAX_AGE_SEC:
+        return None
+    r = np.asarray(scan.ranges, dtype=float)
+    a = scan.angle_min + np.arange(len(r)) * scan.angle_increment
+    ok = np.isfinite(r) & (r > max(scan.range_min, AVOID_SELF_RANGE_M))
+    return r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok])
+
+
+def free_distance(xs, ys, phi, back=0.0):
+    """로봇에서 phi(rad, 정면 기준 왼쪽 +) 방향으로 폭 2*AVOID_HALF_WIDTH_M 통로를 따라 갈 때
+    처음 막히는 거리 [m]. AVOID_LOOK_M까지 비어 있으면 AVOID_LOOK_M."""
+    c, sn = math.cos(phi), math.sin(phi)
+    fx = xs * c + ys * sn
+    fy = -xs * sn + ys * c
+    m = (fx > -back) & (np.abs(fy) < AVOID_HALF_WIDTH_M) & (fx < AVOID_LOOK_M)
+    return float(max(fx[m].min(), 0.0)) if m.any() else AVOID_LOOK_M
+
+
+def choose_heading(xs, ys, bearing_rel, remaining, prev_phi=None):
+    """목표 방위(bearing_rel, rad, 정면 기준)에 가장 가까우면서 통로가 비어 있는 방향 선택.
+    반환: (phi, free_dist) 또는 통과 가능한 방향이 없으면 None."""
+    need = min(AVOID_OK_M, remaining + 0.3)   # 목표가 더 가까우면 그만큼만 비면 됨
+    best = None
+    for deg in range(-AVOID_PHI_RANGE_DEG, AVOID_PHI_RANGE_DEG + 1, 5):
+        phi = math.radians(deg)
+        d = free_distance(xs, ys, phi, AVOID_BODY_BACK_M)
+        if d < need:
+            continue
+        cost = abs(_wrap_deg(math.degrees(phi - bearing_rel)))
+        if prev_phi is not None:
+            cost += AVOID_SWITCH_COST * abs(math.degrees(phi - prev_phi))
+        if best is None or cost < best[0]:
+            best = (cost, phi, d)
+    return None if best is None else (best[1], best[2])
 
 
 def front_clearance(node):
@@ -186,11 +249,52 @@ def wait_for_scan(node, timeout=3.0):
     return False
 
 
+class AvoidState:
+    """한 번의 직진(구간) 동안 유지되는 회피 상태."""
+
+    def __init__(self):
+        self.prev_phi = None
+        self.close_count = 0     # 목표 방향이 막힌 연속 횟수(회피 진입 판정) / 통과 방향 없음 연속 횟수
+        self.avoiding = False
+        self.avoid_sec = 0.0
+
+
+def steer_step(st, bearing_rel, remaining, pts, base_speed, dt):
+    """한 제어 주기의 (전진속도, yaw rate, 이벤트). 이벤트: None | 'avoiding' | 'stop'.
+    평소에는 검증된 방위 보정(목표 방향으로만 조향)만 하고, 목표 방향 통로가 막힐 때만 회피
+    모드로 들어간다 -> 좁은 통로/옆 벽 때문에 멀쩡한 구간에서 옆으로 틀지 않게 함.
+    pts=(xs, ys) 로봇 좌표계 /scan 점. 로봇/ROS 없이 시뮬레이션/재생에서도 호출 가능."""
+    xs, ys = pts
+    z_goal = max(-STEER_MAX_Z, min(STEER_MAX_Z, STEER_KP * bearing_rel))
+    d_goal = free_distance(xs, ys, bearing_rel)          # 목표 방향 통로(몸통 뒤쪽 제외)
+    blocked = d_goal < remaining + 0.3                   # 목표가 장애물보다 앞이면 막힌 게 아님
+    if not st.avoiding:
+        st.close_count = st.close_count + 1 if (d_goal < AVOID_TRIGGER_M and blocked) else 0
+        if st.close_count < GUARD_CONSECUTIVE:
+            return base_speed, z_goal, None
+        st.avoiding, st.close_count, st.prev_phi = True, 0, None
+    elif d_goal >= AVOID_RELEASE_M or not blocked:       # 목표 방향이 충분히 열림 -> 복귀
+        st.avoiding, st.close_count, st.prev_phi = False, 0, None
+        return base_speed, z_goal, None
+    plan = choose_heading(xs, ys, bearing_rel, remaining, st.prev_phi)
+    if plan is None:                       # 통과 가능한 방향이 없음 -> 멈추고, 지속되면 중단
+        st.close_count += 1
+        return 0.0, 0.0, ('stop' if st.close_count >= GUARD_CONSECUTIVE else 'avoiding')
+    st.close_count = 0
+    phi, _ = plan
+    st.prev_phi = phi
+    st.avoid_sec += dt
+    return (min(base_speed, AVOID_SPEED),
+            max(-STEER_MAX_Z, min(STEER_MAX_Z, STEER_KP * phi)), 'avoiding')
+
+
 def _steer_translate(node, tx, ty):
-    """목표 (tx, ty)(월드)까지 직진하며 방위각 오차를 계속 보정해서 이동.
+    """목표 (tx, ty)(월드)까지 이동하며 방위각 오차를 계속 보정하고, 길이 막히면 /scan에서
+    비어 있는 방향으로 돌아서 간다.
     stair_traverse_node.run_translate_segment는 회전 직후 yaw를 그대로 유지만 해서
     회전 오버슈트(+2~3도)가 3~5m 직진 동안 0.2~0.5m 옆 오차로 커졌음(2026-10-07 자율
     1·2차 실행). 여기서는 현재 위치에서 목표를 향한 방위를 매 주기 다시 계산해 보정한다.
+    회피: AVOID_* 상수 참고. 돌아갈 방향이 없거나 한계(옆 이탈/시간)를 넘으면 정지하고 중단.
     E-stop/타임아웃/roll 초과 처리는 run_translate_segment와 동일."""
     log = node.get_logger()
     t0 = time.time()
@@ -198,6 +302,15 @@ def _steer_translate(node, tx, ty):
     bearing = None
     close_count = 0
     speed = node.forward_speed
+    st = AvoidState()
+    was_avoiding = False
+
+    def stop(reason, msg):
+        log.error(msg)
+        node.abort_reason = reason
+        node.emergency_halt()
+        return False
+
     while rclpy.ok():
         rclpy.spin_once(node, timeout_sec=0.0)
         if node.check_estop() or node.check_timeout():
@@ -217,42 +330,58 @@ def _steer_translate(node, tx, ty):
         remaining = math.hypot(tx - x, ty - y)
         planned = math.hypot(tx - start[0], ty - start[1])
         if remaining <= ARRIVE_TOL_M:
-            log.info(f'steer translate 완료: 잔여 {remaining:.2f}m ({time.time() - t0:.1f}s)')
+            log.info(f'steer translate 완료: 잔여 {remaining:.2f}m ({time.time() - t0:.1f}s)'
+                     + (f', 회피 {st.avoid_sec:.1f}s' if st.avoid_sec else ''))
             node.publish_move(0.0, 0.0, 0.0)
             return True
-        if math.hypot(x - start[0], y - start[1]) > planned * 1.3 + 0.5:
-            log.error(f'계획 {planned:.2f}m보다 과도하게 이동 - 중단 (좌표/위치 이상)')
-            node.emergency_halt()
-            return False
-        if GUARD_ENABLED and time.time() - t0 > GUARD_IGNORE_SEC:
+        # 회피로 돌아가면 이동 거리가 늘어나므로 상한은 회피 허용 폭만큼 더 줌
+        if math.hypot(x - start[0], y - start[1]) > planned * 1.3 + 0.5 + (
+                4 * AVOID_MAX_DEV_M if AVOID_ENABLED else 0.0):
+            return stop('position', f'계획 {planned:.2f}m보다 과도하게 이동 - 중단 (좌표/위치 이상)')
+        if bearing is None or remaining > STEER_FREEZE_M:
+            bearing = math.atan2(ty - y, tx - x)
+        bearing_rel = node._wrap_angle(bearing - yaw)
+
+        if GUARD_ENABLED and AVOID_ENABLED:
+            pts = scan_points(node)
+            if pts is None:
+                return stop('scan_lost', '/scan이 끊김(또는 오래됨) - 안전을 위해 정지')
+            line = math.hypot(tx - start[0], ty - start[1]) or 1.0
+            dev = abs((tx - start[0]) * (y - start[1]) - (ty - start[1]) * (x - start[0])) / line
+            if dev > AVOID_MAX_DEV_M:
+                return stop('avoid_limit', f'회피로 직선에서 {dev:.2f}m 벗어남 (한계 '
+                            f'{AVOID_MAX_DEV_M:.1f}m) - 정지')
+            speed, z_cmd, event = steer_step(
+                st, bearing_rel, remaining, pts, node.forward_speed, node.control_dt)
+            if st.avoid_sec > AVOID_MAX_SEC:
+                return stop('avoid_limit', f'회피 {st.avoid_sec:.0f}s 초과 - 정지')
+            if event == 'stop':
+                return stop('obstacle', f'통과 가능한 방향 없음(전방 정지 거리 부족, 잔여 '
+                            f'{remaining:.2f}m) - 정지')
+            if event == 'avoiding' and not was_avoiding:
+                log.info(f'장애물 회피 시작: 목표 방향 통로 막힘, 잔여 {remaining:.2f}m')
+            if event != 'avoiding' and was_avoiding:
+                log.info('장애물 회피 종료 - 목표 방향 복귀')
+            was_avoiding = event == 'avoiding'
+            node.publish_move(speed, 0.0, z_cmd)
+            time.sleep(node.control_dt)
+            continue
+
+        if GUARD_ENABLED and time.time() - t0 > GUARD_IGNORE_SEC:   # 회피 끈 경우: 정지 가드만
             clear = front_clearance(node)
             if clear is None:
-                log.error('/scan이 끊김(또는 오래됨) - 안전을 위해 정지')
-                node.abort_reason = 'scan_lost'
-                node.emergency_halt()
-                return False
-            # 목표가 장애물보다 앞에 있으면(벽 앞 지점 등) 막힌 게 아님
-            blocked = clear < remaining + 0.3
-            if clear < GUARD_STOP_M and blocked:
-                close_count += 1
-            else:
-                close_count = 0
-            # 장애물이 길을 막고 있고 가까워지면 감속해 정지거리를 줄임 (0.6m/s에서 정지 ~0.2m)
+                return stop('scan_lost', '/scan이 끊김(또는 오래됨) - 안전을 위해 정지')
+            blocked = clear < remaining + 0.3     # 목표가 장애물보다 앞이면 막힌 게 아님
+            close_count = close_count + 1 if (clear < GUARD_STOP_M and blocked) else 0
             if blocked and clear < GUARD_SLOW_START_M:
                 frac = (clear - GUARD_STOP_M) / (GUARD_SLOW_START_M - GUARD_STOP_M)
                 speed = max(GUARD_MIN_SPEED, min(node.forward_speed, node.forward_speed * frac))
             else:
                 speed = node.forward_speed
             if close_count >= GUARD_CONSECUTIVE:
-                log.error(f'전방 장애물 {clear:.2f}m < {GUARD_STOP_M:.2f}m (목표까지 잔여 '
-                          f'{remaining:.2f}m) - 정지')
-                node.abort_reason = 'obstacle'
-                node.emergency_halt()
-                return False
-        if bearing is None or remaining > STEER_FREEZE_M:
-            bearing = math.atan2(ty - y, tx - x)
-        err = node._wrap_angle(bearing - yaw)
-        z_cmd = max(-STEER_MAX_Z, min(STEER_MAX_Z, STEER_KP * err))
+                return stop('obstacle', f'전방 장애물 {clear:.2f}m < {GUARD_STOP_M:.2f}m (잔여 '
+                            f'{remaining:.2f}m) - 정지')
+        z_cmd = max(-STEER_MAX_Z, min(STEER_MAX_Z, STEER_KP * bearing_rel))
         node.publish_move(speed, 0.0, z_cmd)
         time.sleep(node.control_dt)
     return False
@@ -408,8 +537,16 @@ def _arg(argv, flag, default=None):
 
 def main():
     argv = sys.argv[1:]
-    hold_sec, waypoints = load_waypoints(
-        os.path.expanduser(_arg(argv, '--wp-file', DEFAULT_WP_FILE)))
+    if '--goto' in argv:
+        k = argv.index('--goto')
+        gx, gy = float(argv[k + 1]), float(argv[k + 2])
+        hold_sec = 1.0
+        waypoints = [{'name': 'GOTO', 'x': gx, 'y': gy, 'photo': False,
+                      'yaw_deg': round(math.degrees(math.atan2(gy, gx)))}]
+        argv = argv + ['--no-photo']
+    else:
+        hold_sec, waypoints = load_waypoints(
+            os.path.expanduser(_arg(argv, '--wp-file', DEFAULT_WP_FILE)))
     only = _arg(argv, '--only')
     if only:
         waypoints = [w for w in waypoints if w['name'] == only]
