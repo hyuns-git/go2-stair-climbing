@@ -34,6 +34,7 @@ setup(
             'email_sender = go2_nav_bridge.email_sender:main',
             'speaker = go2_nav_bridge.speaker:main',
             'rooftop_panorama = go2_nav_bridge.rooftop_panorama:main',
+            'rooftop_waypoint_tour = go2_nav_bridge.rooftop_waypoint_tour:main',
         ],
     },
 )

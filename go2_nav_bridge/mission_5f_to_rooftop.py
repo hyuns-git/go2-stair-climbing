@@ -95,6 +95,7 @@ from go2_nav_bridge.photo_shooter import PhotoShooterNode
 from go2_nav_bridge import email_sender
 from go2_nav_bridge import door_open
 from go2_nav_bridge import rooftop_panorama
+from go2_nav_bridge import rooftop_waypoint_tour
 from go2_nav_bridge import speaker
 
 def _env_float(name, default):
@@ -168,7 +169,12 @@ ROOFTOP_THRESHOLD_TURN_DEG = _env_float('MISSION_THRESHOLD_TURN_DEG', 87.0)
 # K-78: 옥상 문턱 앞은 90도 오른쪽 단독 회전(도그레그 아님, 회전 1회뿐). I-72에서
 # 평지 단독 테스트로 이미 실기 검증된 부호(-turn_direction)와 크기 그대로 재사용.
 
-USE_PANORAMA = _env_bool('MISSION_PANORAMA', True)
+USE_TOUR = _env_bool('MISSION_TOUR', True)
+# 2026-10-07: 옥상 도착 후 4지점 이동 촬영(rooftop_waypoint_tour, ~/rooftop_waypoints.yaml).
+# 켜져 있으면 5방향 파노라마(MISSION_PANORAMA)는 쓰지 않음. 웨이포인트 원점은 옥상 도착
+# 직후(ROOFTOP_FINAL_ADVANCE 후) 로봇 자세 - 조종기 시연 시작 자세와 같아야 하며 코드는
+# 검증 안 함. 전체 미션에서 이 연결은 **실기 검증 0회.**
+USE_PANORAMA = _env_bool('MISSION_PANORAMA', False)
 USE_DOOR_OPEN = _env_bool('MISSION_DOOR_OPEN', True)
 USE_SPEAKER = _env_bool('MISSION_SPEAKER', True)
 DOOR_WAIT_SEC = _env_float('MISSION_DOOR_WAIT_SEC', 15.0)
@@ -176,7 +182,9 @@ ROOFTOP_APPROACH_ADVANCE_M = _env_float('MISSION_ROOFTOP_APPROACH_ADVANCE_M', 0.
 # 2026-09-28 신규(사용자 요청) - flight2 완료 직후 문턱 회전 전에 몇 걸음 더
 # 전진. 첫 실기(0.5m, 실측 0.46m)는 성공했으나 사용자 판단으로 "너무 많다"고
 # 봐서 0.2m로 낮춤. **거리 미실측, 여전히 추정치 - 실기로 계속 조정 가능.**
-ROOFTOP_FINAL_ADVANCE_M = _env_float('MISSION_ROOFTOP_FINAL_ADVANCE_M', 1.0)
+ROOFTOP_FINAL_ADVANCE_M = _env_float('MISSION_ROOFTOP_FINAL_ADVANCE_M', 1.5)
+# 2026-10-07: 1.0 -> 1.5. 전체 미션 첫 실행에서 4지점 투어의 HOME 복귀 중 책상에 부딪힐 뻔해
+# 사람이 개입함. 투어 웨이포인트 원점이 이 전진 직후 자세라 전진을 늘리면 모든 지점이 앞으로 밀림.
 # 2026-09-28 신규(사용자 요청) - flight3 완료 직후 사진 찍기 전 옥상 위로 더
 # 전진(사용자 지정 약 1m). SIDE_ROOFTOP.md의 추락 경고 구간이라 값 조정 시
 # 반드시 짧은 쪽(undershoot)으로 보수적으로 잡을 것. **이 구간도 실기 검증 0회.**
@@ -401,6 +409,11 @@ def run_mission(max_stage: int = None, start_stage: int = 1):
             print('[1/3] 계단 등반 시작 (stair_traverse_node 기존 메서드 재사용, '
                   f'5F 실측 구조로 호출{start_note})')
         climb_node = StairTraverseNode()
+        if USE_TOUR and not rooftop_waypoint_tour.wait_for_scan(climb_node):
+            print('[중단] /scan 없음 - 옥상 이동 촬영의 장애물 가드를 쓸 수 없어 계단 등반 전에 '
+                  '시작을 거부함. scan_maker_l1을 켜거나 TOUR_OBSTACLE_GUARD=0으로 실행.')
+            climb_node.destroy_node()
+            return False
         try:
             climb_ok = climb_5f_to_rooftop(climb_node, max_stage=max_stage, start_stage=start_stage)
         finally:
@@ -417,7 +430,15 @@ def run_mission(max_stage: int = None, start_stage: int = 1):
             return True
 
         print('[2/3] 옥상 도착 - 사진 촬영')
-        if USE_PANORAMA:
+        if USE_TOUR:
+            hold_sec, waypoints = rooftop_waypoint_tour.load_waypoints(
+                rooftop_waypoint_tour.DEFAULT_WP_FILE)
+            tour_ok, tour_photos = rooftop_waypoint_tour.run_tour(waypoints, hold_sec)
+            photo_paths = [p for _, p in tour_photos]
+            if not tour_ok:
+                reason = rooftop_waypoint_tour.LAST_ABORT_REASON or 'E-stop/타임아웃/roll 등'
+                print(f'[경고] 4지점 촬영이 중간에 중단됨({reason}) - 찍힌 것만 전송')
+        elif USE_PANORAMA:
             pano_ok, pano_photos, pano_video = rooftop_panorama.capture_panorama()
             photo_paths = [p for _, p in pano_photos]
             if not pano_ok:
@@ -429,7 +450,10 @@ def run_mission(max_stage: int = None, start_stage: int = 1):
             finally:
                 photo_node.destroy_node()
 
-        if USE_SPEAKER:
+        tour_aborted = USE_TOUR and not tour_ok
+        if USE_SPEAKER and tour_aborted:
+            print('[음성] 4지점 촬영이 중단돼 mission complete 안내는 생략')
+        elif USE_SPEAKER:
             spk_ok, spk_msg = speaker.say_mission_complete()
             print(f'[음성] mission complete 재생 {"성공" if spk_ok else "실패(미션은 계속)"}: {spk_msg}')
     finally:
@@ -439,7 +463,9 @@ def run_mission(max_stage: int = None, start_stage: int = 1):
         print('[경고] 사진 0장 - 이메일은 실패 기록만 담아 계속 전송 시도')
 
     print('[3/3] 이메일 전송')
-    if USE_PANORAMA:
+    if USE_TOUR:
+        ok, err = rooftop_waypoint_tour.send_tour_email(tour_photos, tour_ok)
+    elif USE_PANORAMA:
         ok, err = rooftop_panorama.send_panorama_email(pano_photos, pano_video, pano_ok)
     else:
         ok, err = email_sender.send_mission_email(
@@ -449,6 +475,10 @@ def run_mission(max_stage: int = None, start_stage: int = 1):
         )
     if not ok:
         print(f'[실패] 이메일 전송 실패: {err}')
+        return False
+
+    if USE_TOUR and not tour_ok:
+        print('[부분 완료] 계단 등반은 성공했으나 옥상 이동 촬영이 중단됨 (이메일은 전송됨)')
         return False
 
     print('[완료] 미션 정상 종료')
